@@ -147,8 +147,8 @@ function subscribeData() {
   const uid = currentUser.uid;
 
   // Load user settings
-  getDoc(db.collection('users').doc(uid)).then(snap => {
-    if (snap.exists()) {
+  db.collection('users').doc(uid).get().then(snap => {
+    if (snap.exists) {
       const data = snap.data();
       habitLimit = data.habitLimit || 10;
       document.getElementById('limit-val').textContent = habitLimit;
@@ -200,11 +200,31 @@ window.authSignup = async () => {
 };
 window.authGoogle = async () => {
   try {
-    await auth.signInWithPopup(googleProvider);
+    const err = document.getElementById('auth-error');
+    err.textContent = 'Redirecting to Google…';
+    err.style.color = 'var(--green)';
+    await auth.signInWithRedirect(googleProvider);
   } catch(e) {
-    document.getElementById('auth-error').textContent = e.message.replace('Firebase: ','').replace(/\(.*\)/,'');
+    const err = document.getElementById('auth-error');
+    err.style.color = '';
+    err.textContent = e.message.replace('Firebase: ','').replace(/\(.*\)/,'');
   }
 };
+
+// ── Handle Google redirect result on every page load ──────────────────────────
+auth.getRedirectResult().then(result => {
+  // onAuthStateChanged handles everything after successful redirect
+}).catch(e => {
+  if (e && e.code && e.code !== 'auth/no-current-user') {
+    setTimeout(() => {
+      const el = document.getElementById('auth-error');
+      if (el) {
+        el.style.color = '';
+        el.textContent = e.message.replace('Firebase: ','').replace(/\(.*\)/,'');
+      }
+    }, 600);
+  }
+});
 window.doSignOut = async () => {
   const ref = db.collection('users').doc(currentUser.uid).collection('devices').doc(deviceId);
   await ref.set({ lastSeen: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
