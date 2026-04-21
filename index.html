@@ -1,0 +1,1303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#0a0d14"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="Streaks"/>
+<title>Streaks – Habit Tracker</title>
+<link rel="manifest" href="manifest.json"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet"/>
+
+<!-- Firebase Compat SDK -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+
+// ─── FIREBASE CONFIG ─────────────────────────────────────────────────────────
+// INSTRUCTIONS: Replace this config with your own Firebase project config.
+// 1. Go to console.firebase.google.com
+// 2. Create a project → Add web app → Copy config
+// 3. Enable Authentication (Email/Password + Google)
+// 4. Enable Firestore Database (start in test mode)
+const firebaseConfig = {
+  apiKey: "YOUR_API_KEY",
+  authDomain: "YOUR_PROJECT.firebaseapp.com",
+  projectId: "YOUR_PROJECT_ID",
+  storageBucket: "YOUR_PROJECT.appspot.com",
+  messagingSenderId: "YOUR_SENDER_ID",
+  appId: "YOUR_APP_ID"
+};
+
+firebase.initializeApp(firebaseConfig);
+const auth = firebase.auth();
+const db = firebase.firestore();
+const googleProvider = new firebase.auth.GoogleAuthProvider();
+
+// ─── STATE ───────────────────────────────────────────────────────────────────
+let currentUser = null;
+let habits = [];
+let completions = {}; // { 'habitId_YYYY-MM-DD': 1 }
+let habitLimit = 10;
+let unsubHabits = null;
+let unsubCompletions = null;
+let deviceId = localStorage.getItem('streaks_deviceId') || (() => {
+  const id = 'dev_' + Math.random().toString(36).slice(2,10);
+  localStorage.setItem('streaks_deviceId', id);
+  return id;
+})();
+
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function dateStr(d) {
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+function ck(habitId, date) { return habitId + '_' + (date || todayStr()); }
+function isDone(habitId, date) { return !!(completions[ck(habitId, date)]); }
+function getGreeting() {
+  const h = new Date().getHours();
+  return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
+}
+function fmtDate(d) {
+  const days = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return days[d.getDay()] + ', ' + months[d.getMonth()] + ' ' + d.getDate();
+}
+function initials(name) {
+  return (name||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+}
+function getStreak(habitId) {
+  let streak = 0;
+  const d = new Date();
+  for (let i = 0; i < 365; i++) {
+    const ds = dateStr(d);
+    if (ds === todayStr() && !isDone(habitId, ds)) { d.setDate(d.getDate()-1); continue; }
+    if (isDone(habitId, ds)) { streak++; d.setDate(d.getDate()-1); }
+    else break;
+  }
+  return streak;
+}
+function getBestStreak(habitId) {
+  let best = 0, cur = 0;
+  for (let i = 89; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate()-i);
+    if (isDone(habitId, dateStr(d))) { cur++; best = Math.max(best,cur); }
+    else cur = 0;
+  }
+  return best;
+}
+function getRate(habitId, days) {
+  let done = 0;
+  for (let i = 0; i < days; i++) {
+    const d = new Date(); d.setDate(d.getDate()-i);
+    if (isDone(habitId, dateStr(d))) done++;
+  }
+  return days > 0 ? Math.round(done/days*100) : 0;
+}
+function getDaysInPeriod(period) {
+  if (period === 'week') return 7;
+  if (period === 'month') {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth()+1, 0).getDate();
+  }
+  return 90;
+}
+
+// ─── AUTH LISTENERS ──────────────────────────────────────────────────────────
+auth.onAuthStateChanged( async user => {
+  currentUser = user;
+  if (user) {
+    document.getElementById('auth-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+    updateUserUI();
+    await registerDevice();
+    subscribeData();
+  } else {
+    document.getElementById('auth-screen').style.display = 'flex';
+    document.getElementById('app').style.display = 'none';
+    if (unsubHabits) unsubHabits();
+    if (unsubCompletions) unsubCompletions();
+  }
+});
+
+// ─── DEVICE REGISTRATION ─────────────────────────────────────────────────────
+async function registerDevice() {
+  const ua = navigator.userAgent;
+  let device = 'Browser';
+  if (/iPhone/.test(ua)) device = 'iPhone';
+  else if (/iPad/.test(ua)) device = 'iPad';
+  else if (/Android/.test(ua)) device = 'Android';
+  else if (/Mac/.test(ua)) device = 'Mac';
+  else if (/Windows/.test(ua)) device = 'Windows';
+
+  const ref = db.collection('users').doc(currentUser.uid).collection('devices').doc(deviceId);
+  await ref.set({
+    name: device,
+    lastSeen: firebase.firestore.FieldValue.serverTimestamp(),
+    userAgent: ua.slice(0,120)
+  }, { merge: true });
+}
+
+// ─── FIRESTORE SUBSCRIPTIONS ─────────────────────────────────────────────────
+function subscribeData() {
+  const uid = currentUser.uid;
+
+  // Load user settings
+  getDoc(db.collection('users').doc(uid)).then(snap => {
+    if (snap.exists()) {
+      const data = snap.data();
+      habitLimit = data.habitLimit || 10;
+      document.getElementById('limit-val').textContent = habitLimit;
+    } else {
+      db.collection('users').doc(uid).set({ habitLimit: 10, createdAt: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    }
+  });
+
+  // Habits real-time
+  unsubHabits = db.collection('users').doc(uid).collection('habits').orderBy('createdAt').onSnapshot(snap => {
+      habits = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+      renderToday(); updateRing(); updateUserUI();
+    });
+
+  // Completions real-time
+  unsubCompletions = db.collection('users').doc(uid).collection('completions').onSnapshot(snap => {
+      completions = {};
+      snap.docs.forEach(d => { completions[d.id] = d.data().count || 1; });
+      renderToday(); updateRing();
+      if (document.getElementById('screen-stats').classList.contains('active')) renderStats();
+      if (document.getElementById('screen-cal').classList.contains('active')) renderCal();
+    });
+}
+
+// ─── AUTH ACTIONS ─────────────────────────────────────────────────────────────
+window.authLogin = async () => {
+  const email = document.getElementById('auth-email').value.trim();
+  const pass = document.getElementById('auth-pass').value;
+  const err = document.getElementById('auth-error');
+  try {
+    err.textContent = '';
+    await auth.signInWithEmailAndPassword(email, pass);
+  } catch(e) {
+    err.textContent = e.message.replace('Firebase: ','').replace(/\(.*\)/,'');
+  }
+};
+window.authSignup = async () => {
+  const email = document.getElementById('auth-email').value.trim();
+  const pass = document.getElementById('auth-pass').value;
+  const name = document.getElementById('auth-name').value.trim();
+  const err = document.getElementById('auth-error');
+  try {
+    err.textContent = '';
+    const cred = await auth.createUserWithEmailAndPassword(email, pass);
+    if (name) await cred.user.updateProfile({ displayName: name });
+  } catch(e) {
+    err.textContent = e.message.replace('Firebase: ','').replace(/\(.*\)/,'');
+  }
+};
+window.authGoogle = async () => {
+  try {
+    await auth.signInWithPopup(googleProvider);
+  } catch(e) {
+    document.getElementById('auth-error').textContent = e.message.replace('Firebase: ','').replace(/\(.*\)/,'');
+  }
+};
+window.doSignOut = async () => {
+  const ref = db.collection('users').doc(currentUser.uid).collection('devices').doc(deviceId);
+  await ref.set({ lastSeen: firebase.firestore.FieldValue.serverTimestamp() }, { merge: true });
+  await auth.signOut();
+};
+
+// ─── HABIT CRUD ──────────────────────────────────────────────────────────────
+window.addHabit = async () => {
+  const name = document.getElementById('new-name').value.trim();
+  if (!name) { document.getElementById('new-name').focus(); return; }
+  if (habits.length >= habitLimit) {
+    showToast('Habit limit reached! Increase it in Settings.');
+    return;
+  }
+  const uid = currentUser.uid;
+  const ref = db.collection('users').doc(uid).collection('habits').doc();
+  await ref.set({
+    name, icon: window.selIcon || '🎯',
+    color: window.ICON_COLORS[window.selIcon] || '#1a3a1a',
+    time: window.selTime || 'Anytime',
+    createdAt: firebase.firestore.FieldValue.serverTimestamp()
+  });
+  document.getElementById('add-overlay').classList.remove('open');
+  document.getElementById('new-name').value = '';
+  showToast('Habit added!');
+};
+
+window.deleteHabit = async (id) => {
+  if (!confirm('Delete this habit and all its history?')) return;
+  const uid = currentUser.uid;
+  await db.collection('users').doc(uid).collection('habits').doc(id).delete();
+  // Remove completions for this habit
+  const batch = db.batch();
+  const comps = await db.collection('users').doc(uid).collection('completions').get();
+  comps.docs.filter(d => d.id.startsWith(id + '_')).forEach(d => batch.delete(d.ref));
+  await batch.commit();
+  closeDetail();
+  showToast('Habit deleted.');
+};
+
+window.toggleHabit = async (id, btnEl) => {
+  const uid = currentUser.uid;
+  const key = ck(id);
+  const ref = db.collection('users').doc(uid).collection('completions').doc(key);
+  if (completions[key]) {
+    await ref.delete();
+  } else {
+    await ref.set({ habitId: id, date: todayStr(), count: 1, ts: firebase.firestore.FieldValue.serverTimestamp() });
+  }
+  if (btnEl) { btnEl.classList.add('popping'); setTimeout(() => btnEl.classList.remove('popping'), 400); }
+};
+
+// ─── LIMIT CONTROL ───────────────────────────────────────────────────────────
+window.adjustLimit = async (delta) => {
+  habitLimit = Math.max(1, Math.min(50, habitLimit + delta));
+  document.getElementById('limit-val').textContent = habitLimit;
+  await db.collection('users').doc(currentUser.uid).set({ habitLimit }, { merge: true });
+};
+
+// ─── DEVICE MANAGEMENT ───────────────────────────────────────────────────────
+window.loadDevices = async () => {
+  const uid = currentUser.uid;
+  const snap = await db.collection('users').doc(uid).collection('devices').get();
+  const list = document.getElementById('devices-list');
+  list.innerHTML = '';
+  snap.docs.forEach(d => {
+    const data = d.data();
+    const isThis = d.id === deviceId;
+    const ts = data.lastSeen?.toDate ? data.lastSeen.toDate().toLocaleDateString() : 'Unknown';
+    list.innerHTML += `<div class="device-row">
+      <div class="device-icon">${getDeviceIcon(data.name)}</div>
+      <div class="device-info">
+        <div class="device-name">${data.name || 'Unknown'} ${isThis ? '<span class="this-device">This device</span>' : ''}</div>
+        <div class="device-meta">Last seen ${ts}</div>
+      </div>
+      ${!isThis ? `<button class="device-remove" onclick="removeDevice('${d.id}')">Remove</button>` : ''}
+    </div>`;
+  });
+};
+window.removeDevice = async (devId) => {
+  await db.collection('users').doc(currentUser.uid).collection('devices').doc(devId).delete();
+  loadDevices();
+  showToast('Device removed.');
+};
+function getDeviceIcon(name) {
+  if (!name) return '💻';
+  if (/iPhone|iPad/i.test(name)) return '📱';
+  if (/Android/i.test(name)) return '📱';
+  if (/Mac/i.test(name)) return '💻';
+  return '🖥️';
+}
+
+// ─── UI: SCREENS ─────────────────────────────────────────────────────────────
+window.showScreen = (name) => {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('screen-' + name).classList.add('active');
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  const nb = document.getElementById('nav-' + name);
+  if (nb) nb.classList.add('active');
+  document.getElementById('fab').style.display = name === 'today' ? 'flex' : 'none';
+  if (name === 'cal') renderCal();
+  if (name === 'stats') { statsPeriod = 'week'; renderStats(); }
+  if (name === 'account') { updateUserUI(); loadDevices(); }
+};
+
+function updateUserUI() {
+  const name = currentUser?.displayName || currentUser?.email?.split('@')[0] || 'You';
+  const email = currentUser?.email || '';
+  const ini = initials(name);
+  ['user-avatar','acc-avatar'].forEach(id => { const el = document.getElementById(id); if(el) el.textContent = ini; });
+  const nn = document.getElementById('acc-name'); if(nn) nn.textContent = name;
+  const ne = document.getElementById('acc-email'); if(ne) ne.textContent = email;
+  const pl = document.getElementById('acc-plan'); if(pl) pl.textContent = `${habits.length}/${habitLimit} habits`;
+  document.getElementById('greeting-text').textContent = getGreeting() + ', ' + name.split(' ')[0];
+  document.getElementById('date-text').textContent = fmtDate(new Date());
+}
+
+// ─── UI: TODAY ────────────────────────────────────────────────────────────────
+const TIMES = ['Morning','Afternoon','Evening','Anytime'];
+
+function renderToday() {
+  const container = document.getElementById('today-content');
+  container.innerHTML = '';
+  if (!habits.length) {
+    container.innerHTML = `<div class="empty-state"><div class="empty-icon">✨</div>
+      <div class="empty-title">No habits yet</div>
+      <div class="empty-sub">Tap + to add your first habit and start your streak.</div></div>`;
+    return;
+  }
+  TIMES.forEach(t => {
+    const group = habits.filter(h => h.time === t);
+    if (!group.length) return;
+    const lbl = document.createElement('div');
+    lbl.className = 'section-head'; lbl.textContent = t;
+    container.appendChild(lbl);
+    const grp = document.createElement('div');
+    grp.className = 'habits-group';
+    group.forEach((h, i) => {
+      const done = isDone(h.id);
+      const card = document.createElement('div');
+      card.className = 'habit-card' + (done ? ' done' : '');
+      card.style.animationDelay = (i * 0.04) + 's';
+      card.innerHTML = `
+        <div class="hc-icon" style="background:${h.color||'#1a3a1a'}">${h.icon||'🎯'}</div>
+        <div class="hc-info">
+          <div class="hc-name${done?' struck':''}">${h.name}</div>
+          <div class="hc-meta">${getStreak(h.id)} day streak · ${h.time}</div>
+        </div>
+        <div class="check${done?' done':''}" data-id="${h.id}">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <polyline points="2,7 5.5,10.5 12,3.5" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>`;
+      card.querySelector('.check').addEventListener('click', e => {
+        e.stopPropagation();
+        toggleHabit(h.id, e.currentTarget);
+      });
+      card.addEventListener('click', () => openDetail(h.id));
+      grp.appendChild(card);
+    });
+    container.appendChild(grp);
+  });
+}
+
+function updateRing() {
+  const total = habits.length;
+  const done = habits.filter(h => isDone(h.id)).length;
+  const circ = 175.9;
+  const offset = total > 0 ? circ - (done/total)*circ : circ;
+  document.getElementById('ring-arc').style.strokeDashoffset = offset;
+  document.getElementById('ring-done').textContent = done;
+  document.getElementById('ring-total').textContent = '/ ' + total;
+  const maxStreak = habits.length ? Math.max(...habits.map(h => getStreak(h.id)), 0) : 0;
+  document.getElementById('streak-num').textContent = maxStreak;
+  const msgs = ['Start your day strong!','Great start!','Halfway there!','Almost done!','All complete! 🎉'];
+  const idx = total > 0 ? Math.min(Math.floor(done/total*5), 4) : 0;
+  document.getElementById('hero-title').textContent = total > 0 ? `${done} of ${total} done` : 'No habits yet';
+  document.getElementById('hero-sub').textContent = total > 0 ? msgs[idx] : 'Tap + to begin';
+}
+
+// ─── UI: DETAIL MODAL ─────────────────────────────────────────────────────────
+window.openDetail = (id) => {
+  const h = habits.find(x => x.id === id);
+  if (!h) return;
+  const streak = getStreak(h.id);
+  const rate = getRate(h.id, 30);
+  const best = getBestStreak(h.id);
+  const done = isDone(h.id);
+  const cells = Array.from({length:28}, (_,i) => {
+    const d = new Date(); d.setDate(d.getDate()-(27-i));
+    return isDone(h.id, dateStr(d));
+  });
+  document.getElementById('detail-body').innerHTML = `
+    <div class="detail-hero">
+      <div class="detail-big-icon" style="background:${h.color||'#1a3a1a'}">${h.icon||'🎯'}</div>
+      <div>
+        <div class="detail-name">${h.name}</div>
+        <div class="detail-type">${h.time} habit</div>
+      </div>
+    </div>
+    <div class="detail-stats">
+      <div class="ds"><div class="ds-val">${streak}</div><div class="ds-lbl">Streak</div></div>
+      <div class="ds"><div class="ds-val">${rate}%</div><div class="ds-lbl">30-day</div></div>
+      <div class="ds"><div class="ds-val">${best}</div><div class="ds-lbl">Best</div></div>
+    </div>
+    <div style="font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);margin-bottom:8px;">Last 28 days</div>
+    <div class="mini-cal">${cells.map(c=>`<div class="mc ${c?'mc-done':'mc-miss'}"></div>`).join('')}</div>
+    <div class="detail-actions">
+      <button class="da-btn danger" onclick="deleteHabit('${id}')">Delete</button>
+      <button class="da-btn" onclick="closeDetail()">Close</button>
+      <button class="da-btn primary" onclick="toggleHabit('${id}');closeDetail();">${done?'Unmark':'Mark done'}</button>
+    </div>`;
+  document.getElementById('detail-overlay').classList.add('open');
+};
+window.closeDetail = (e) => {
+  if (!e || e.target === document.getElementById('detail-overlay'))
+    document.getElementById('detail-overlay').classList.remove('open');
+};
+
+// ─── UI: ADD MODAL ────────────────────────────────────────────────────────────
+const ICONS = ['🏃','🧘','📚','💧','🥗','🛏','✍️','🎯','🎸','🌿','💪','🎨','🚶','🏊','🧹','🍎','☕','🐕','🧠','🎵'];
+window.ICON_COLORS = {
+  '🏃':'#0f3d28','🧘':'#1a3a1a','📚':'#0d2a4a','💧':'#0d2a4a','🥗':'#1a3a1a',
+  '🛏':'#3a2a0a','✍️':'#3a2a0a','🎯':'#3a1a10','🎸':'#2d1a3a','🌿':'#0f3d28',
+  '💪':'#3a1a10','🎨':'#2d1a3a','🚶':'#0f3d28','🏊':'#0d2a4a','🧹':'#1a1a3a',
+  '🍎':'#3a1010','☕':'#3a2a0a','🐕':'#1a3a1a','🧠':'#2a0d3a','🎵':'#2d1a3a'
+};
+window.selIcon = ICONS[0];
+window.selTime = 'Morning';
+
+window.openAddModal = () => {
+  buildIconPicker(); buildTimeChips();
+  document.getElementById('new-name').value = '';
+  document.getElementById('add-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('new-name').focus(), 150);
+};
+window.closeAdd = (e) => {
+  if (!e || e.target === document.getElementById('add-overlay'))
+    document.getElementById('add-overlay').classList.remove('open');
+};
+
+function buildIconPicker() {
+  const row = document.getElementById('icon-picker');
+  row.innerHTML = '';
+  ICONS.forEach(ic => {
+    const el = document.createElement('div');
+    el.className = 'ip-opt' + (ic === window.selIcon ? ' sel' : '');
+    el.textContent = ic;
+    el.onclick = () => {
+      window.selIcon = ic;
+      document.querySelectorAll('.ip-opt').forEach(x => x.classList.remove('sel'));
+      el.classList.add('sel');
+    };
+    row.appendChild(el);
+  });
+}
+function buildTimeChips() {
+  const row = document.getElementById('time-chips');
+  row.innerHTML = '';
+  TIMES.forEach(t => {
+    const el = document.createElement('button');
+    el.className = 'time-chip' + (t === window.selTime ? ' sel' : '');
+    el.textContent = t;
+    el.onclick = () => {
+      window.selTime = t;
+      document.querySelectorAll('.time-chip').forEach(x => x.classList.remove('sel'));
+      el.classList.add('sel');
+    };
+    row.appendChild(el);
+  });
+}
+
+// ─── CALENDAR ────────────────────────────────────────────────────────────────
+let calDate = new Date();
+const MONTHS_LONG = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function renderCal() {
+  document.getElementById('cal-month-lbl').textContent = MONTHS_LONG[calDate.getMonth()] + ' ' + calDate.getFullYear();
+  const grid = document.getElementById('cal-grid');
+  grid.innerHTML = '';
+  const first = new Date(calDate.getFullYear(), calDate.getMonth(), 1).getDay();
+  const days = new Date(calDate.getFullYear(), calDate.getMonth()+1, 0).getDate();
+  const today = new Date();
+  for (let i = 0; i < first; i++) { const e = document.createElement('div'); e.className='cal-cell'; grid.appendChild(e); }
+  for (let d = 1; d <= days; d++) {
+    const cell = document.createElement('div');
+    const thisDate = new Date(calDate.getFullYear(), calDate.getMonth(), d);
+    const ds = dateStr(thisDate);
+    const isToday = ds === todayStr();
+    const isPast = thisDate <= today;
+    const total = habits.length;
+    const doneCount = habits.filter(h => isDone(h.id, ds)).length;
+    let dotClass = '';
+    if (isPast && total > 0) {
+      dotClass = doneCount === total ? 'dot-full' : doneCount > 0 ? 'dot-partial' : 'dot-miss';
+    }
+    cell.className = 'cal-cell' + (isToday ? ' today-cell' : '');
+    cell.innerHTML = (isToday ? '<div class="cal-today-bg"></div>' : '') +
+      `<span class="cal-num">${d}</span>` +
+      (isPast && total > 0 ? `<div class="cal-dot ${dotClass}"></div>` : '');
+    cell.addEventListener('click', () => showCalDetail(ds, d));
+    grid.appendChild(cell);
+  }
+  showCalDetail(todayStr(), today.getDate());
+}
+function showCalDetail(ds, d) {
+  const [y,m] = ds.split('-');
+  const detail = document.getElementById('cal-detail');
+  if (!habits.length) { detail.innerHTML = `<div class="cal-detail-date">No habits tracked yet.</div>`; return; }
+  detail.innerHTML = `<div class="cal-detail-date">${MONTHS_SHORT[parseInt(m)-1]} ${parseInt(d)}, ${y}</div>` +
+    habits.map(h => `<div class="cal-row">
+      <div class="cal-row-icon">${h.icon||'🎯'}</div>
+      <div class="cal-row-name">${h.name}</div>
+      <div class="cal-row-status">${isDone(h.id, ds) ? '✅' : '⬜'}</div>
+    </div>`).join('');
+}
+window.prevMonth = () => { calDate = new Date(calDate.getFullYear(), calDate.getMonth()-1, 1); renderCal(); };
+window.nextMonth = () => { calDate = new Date(calDate.getFullYear(), calDate.getMonth()+1, 1); renderCal(); };
+
+// ─── STATS + KPI DASHBOARD ────────────────────────────────────────────────────
+let statsPeriod = 'week';
+window.setStatsPeriod = (p) => {
+  statsPeriod = p;
+  document.querySelectorAll('.period-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.period-btn[data-p="${p}"]`).classList.add('active');
+  renderStats();
+};
+
+function renderStats() {
+  const days = getDaysInPeriod(statsPeriod);
+  const total = habits.length;
+
+  // KPIs
+  let totalCompletions = 0;
+  let bestStreakPeriod = 0;
+  let mostConsistentHabit = null;
+  let maxRate = -1;
+
+  habits.forEach(h => {
+    let periodDone = 0;
+    for (let i = 0; i < days; i++) {
+      const d = new Date(); d.setDate(d.getDate()-i);
+      if (isDone(h.id, dateStr(d))) { totalCompletions++; periodDone++; }
+    }
+    const rate = days > 0 ? Math.round(periodDone/days*100) : 0;
+    if (rate > maxRate) { maxRate = rate; mostConsistentHabit = h; }
+    bestStreakPeriod = Math.max(bestStreakPeriod, getBestStreak(h.id));
+  });
+
+  const totalSlots = total * days;
+  const avgRate = totalSlots > 0 ? Math.round(totalCompletions/totalSlots*100) : 0;
+
+  document.getElementById('kpi-completions').textContent = totalCompletions;
+  document.getElementById('kpi-avg-rate').textContent = avgRate + '%';
+  document.getElementById('kpi-best-streak').textContent = bestStreakPeriod;
+  document.getElementById('kpi-consistent').textContent = mostConsistentHabit
+    ? (mostConsistentHabit.icon + ' ' + mostConsistentHabit.name.slice(0,14))
+    : '—';
+
+  // Heatmap
+  renderHeatmap(days);
+
+  // Week bar chart
+  const chart = document.getElementById('week-chart');
+  chart.innerHTML = '';
+  const chartDays = Math.min(days, 14);
+  const chartData = Array.from({length:chartDays}, (_,i) => {
+    const d = new Date(); d.setDate(d.getDate()-(chartDays-1-i));
+    const ds = dateStr(d);
+    const dayNames = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+    return { label: dayNames[d.getDay()], count: habits.filter(h=>isDone(h.id,ds)).length, isToday: i===chartDays-1 };
+  });
+  const maxC = Math.max(...chartData.map(x=>x.count), 1);
+  chartData.forEach(cd => {
+    const col = document.createElement('div');
+    col.className = 'bar-col';
+    const pct = Math.round(cd.count/maxC*100);
+    col.innerHTML = `<div style="font-size:10px;color:var(--text3);font-weight:600;">${cd.count||''}</div>
+      <div class="bar${cd.isToday?' today-bar':cd.count>0?' has-data':''}" style="height:${Math.max(pct,4)}%;"></div>
+      <div class="bar-day">${cd.label}</div>`;
+    chart.appendChild(col);
+  });
+
+  // Per habit list
+  const list = document.getElementById('habit-stats');
+  list.innerHTML = !habits.length
+    ? '<div style="color:var(--text3);font-size:14px;padding:16px 0;">Add habits to see statistics.</div>'
+    : habits.map(h => {
+        const r = getRate(h.id, days);
+        return `<div class="habit-stat">
+          <div class="hs-icon" style="background:${h.color||'#1a3a1a'}">${h.icon||'🎯'}</div>
+          <div class="hs-info">
+            <div class="hs-name">${h.name}</div>
+            <div class="hs-bar-bg"><div class="hs-bar-fill" style="width:${r}%"></div></div>
+          </div>
+          <div class="hs-pct">${r}%</div>
+        </div>`;
+      }).join('');
+}
+
+function renderHeatmap(days) {
+  const heatmap = document.getElementById('heatmap');
+  heatmap.innerHTML = '';
+  const cols = Math.min(days, 30);
+  for (let i = cols-1; i >= 0; i--) {
+    const d = new Date(); d.setDate(d.getDate()-i);
+    const ds = dateStr(d);
+    const total = habits.length;
+    const done = habits.filter(h => isDone(h.id, ds)).length;
+    const intensity = total > 0 ? done/total : 0;
+    const cell = document.createElement('div');
+    cell.className = 'hm-cell';
+    let bg = 'var(--bg4)';
+    if (intensity > 0 && intensity <= 0.33) bg = 'rgba(29,184,122,0.25)';
+    else if (intensity > 0.33 && intensity <= 0.66) bg = 'rgba(29,184,122,0.55)';
+    else if (intensity > 0.66 && intensity < 1) bg = 'rgba(29,184,122,0.8)';
+    else if (intensity === 1) bg = 'var(--green)';
+    cell.style.background = bg;
+    cell.title = `${ds}: ${done}/${total} done`;
+    heatmap.appendChild(cell);
+  }
+}
+
+// ─── PDF EXPORT ───────────────────────────────────────────────────────────────
+window.exportPDF = async (type) => {
+  showToast('Generating PDF...');
+
+  // Load jsPDF
+  if (!window.jsPDF) {
+    await new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = 'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js';
+      s.onload = res; s.onerror = rej;
+      document.head.appendChild(s);
+    });
+  }
+
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4' });
+  const pageW = 210, margin = 18;
+  let y = 20;
+
+  const userName = currentUser?.displayName || currentUser?.email?.split('@')[0] || 'User';
+  const now = new Date();
+
+  // Header
+  pdf.setFillColor(10, 13, 20);
+  pdf.rect(0, 0, pageW, 36, 'F');
+  pdf.setTextColor(29, 184, 122);
+  pdf.setFontSize(20);
+  pdf.setFont('helvetica', 'bold');
+  pdf.text('🔥 Streaks – Habit Report', margin, 16);
+  pdf.setTextColor(180, 190, 210);
+  pdf.setFontSize(9);
+  pdf.setFont('helvetica', 'normal');
+
+  let periodLabel = 'Today';
+  let daysBack = 1;
+  if (type === 'month') { periodLabel = 'This Month'; daysBack = new Date(now.getFullYear(), now.getMonth()+1, 0).getDate(); }
+  if (type === 'history') { periodLabel = 'Full History (90 days)'; daysBack = 90; }
+  pdf.text(`${userName}  ·  ${periodLabel}  ·  Generated ${now.toLocaleDateString()}`, margin, 27);
+  y = 48;
+
+  // Summary row
+  const totalC = habits.reduce((s,h) => {
+    let c = 0;
+    for (let i=0;i<daysBack;i++){const d=new Date();d.setDate(d.getDate()-i);if(isDone(h.id,dateStr(d)))c++;}
+    return s+c;
+  }, 0);
+  const avgR = habits.length && daysBack ? Math.round(totalC/(habits.length*daysBack)*100) : 0;
+
+  pdf.setFillColor(22, 28, 40);
+  pdf.roundedRect(margin, y, pageW-margin*2, 22, 3, 3, 'F');
+  pdf.setTextColor(29, 184, 122);
+  pdf.setFontSize(10); pdf.setFont('helvetica','bold');
+  pdf.text(`${totalC} completions`, margin+6, y+10);
+  pdf.text(`${avgR}% avg rate`, margin+60, y+10);
+  pdf.text(`${habits.length} habits tracked`, margin+110, y+10);
+  pdf.setTextColor(150, 160, 180);
+  pdf.setFontSize(8); pdf.setFont('helvetica','normal');
+  pdf.text('Total', margin+6, y+18);
+  pdf.text('Completion', margin+60, y+18);
+  pdf.text('Active', margin+110, y+18);
+  y += 30;
+
+  // Per habit sections
+  habits.forEach((h, hi) => {
+    if (y > 250) { pdf.addPage(); y = 20; }
+    // Habit header bar
+    pdf.setFillColor(20, 26, 38);
+    pdf.roundedRect(margin, y, pageW-margin*2, 14, 2, 2, 'F');
+    pdf.setTextColor(240, 244, 255);
+    pdf.setFontSize(11); pdf.setFont('helvetica','bold');
+    pdf.text(`${h.icon || ''} ${h.name}`, margin+4, y+10);
+    const streak = getStreak(h.id);
+    const rate = getRate(h.id, daysBack);
+    pdf.setTextColor(29, 184, 122);
+    pdf.setFontSize(9);
+    pdf.text(`Streak: ${streak}d  ·  Rate: ${rate}%`, pageW - margin - 50, y+10);
+    y += 18;
+
+    // Date rows
+    const colW = (pageW - margin*2) / 7;
+    const rows = [];
+    for (let i = daysBack-1; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate()-i);
+      rows.push({ ds: dateStr(d), label: d.getDate() + '/' + (d.getMonth()+1), done: isDone(h.id, dateStr(d)) });
+    }
+
+    // Draw 7-per-row grid
+    for (let r = 0; r < rows.length; r += 7) {
+      if (y > 270) { pdf.addPage(); y = 20; }
+      const rowSlice = rows.slice(r, r+7);
+      rowSlice.forEach((item, ci) => {
+        const x = margin + ci * colW;
+        if (item.done) {
+          pdf.setFillColor(29, 184, 122);
+          pdf.roundedRect(x+1, y, colW-2, 10, 1, 1, 'F');
+          pdf.setTextColor(255,255,255);
+        } else {
+          pdf.setFillColor(28, 35, 52);
+          pdf.roundedRect(x+1, y, colW-2, 10, 1, 1, 'F');
+          pdf.setTextColor(90, 100, 120);
+        }
+        pdf.setFontSize(7); pdf.setFont('helvetica', item.done ? 'bold' : 'normal');
+        pdf.text(item.label, x + colW/2, y+7, { align:'center' });
+      });
+      y += 12;
+    }
+    y += 6;
+
+    // Legend on first habit
+    if (hi === 0 && type !== 'today') {
+      pdf.setTextColor(100, 110, 130);
+      pdf.setFontSize(7);
+      pdf.text('■ Completed  □ Missed', margin, y); y += 6;
+    }
+  });
+
+  // Footer
+  pdf.setFillColor(10, 13, 20);
+  pdf.rect(0, 287, pageW, 10, 'F');
+  pdf.setTextColor(80, 90, 110);
+  pdf.setFontSize(7);
+  pdf.text('Generated by Streaks PWA · streaks-app.vercel.app', margin, 293);
+  pdf.text(`Page 1`, pageW - margin, 293, { align: 'right' });
+
+  pdf.save(`streaks-${type}-${todayStr()}.pdf`);
+  showToast('PDF downloaded!');
+};
+
+// ─── TOAST ────────────────────────────────────────────────────────────────────
+function showToast(msg) {
+  let t = document.getElementById('toast');
+  if (!t) { t = document.createElement('div'); t.id='toast'; document.body.appendChild(t); }
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._timer);
+  t._timer = setTimeout(() => t.classList.remove('show'), 2800);
+}
+
+// ─── AUTH SCREEN TOGGLE ───────────────────────────────────────────────────────
+window.toggleAuthMode = () => {
+  const isLogin = document.getElementById('auth-mode').dataset.mode === 'login';
+  document.getElementById('auth-mode').dataset.mode = isLogin ? 'signup' : 'login';
+  document.getElementById('auth-title').textContent = isLogin ? 'Create account' : 'Welcome back';
+  document.getElementById('auth-name-row').style.display = isLogin ? 'block' : 'none';
+  document.getElementById('auth-submit-btn').textContent = isLogin ? 'Create account' : 'Sign in';
+  document.getElementById('auth-toggle-lbl').textContent = isLogin ? 'Already have an account? ' : "Don't have an account? ";
+  document.getElementById('auth-toggle-btn').textContent = isLogin ? 'Sign in' : 'Sign up';
+  document.getElementById('auth-error').textContent = '';
+};
+window.authSubmit = () => {
+  const mode = document.getElementById('auth-mode').dataset.mode;
+  if (mode === 'login') authLogin();
+  else authSignup();
+};
+
+// ─── KEYBOARD ─────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter') {
+    if (document.getElementById('add-overlay').classList.contains('open')) addHabit();
+    if (document.getElementById('auth-screen').style.display !== 'none') authSubmit();
+  }
+  if (e.key === 'Escape') { closeAdd(); closeDetail(); }
+});
+
+</script>
+
+<style>
+:root {
+  --bg: #0a0d14;
+  --bg2: #111622;
+  --bg3: #171e2e;
+  --bg4: #1e2840;
+  --surface: #1a2238;
+  --border: rgba(255,255,255,0.07);
+  --border2: rgba(255,255,255,0.13);
+  --green: #1db87a;
+  --green2: #17a06a;
+  --green-dim: rgba(29,184,122,0.14);
+  --green-glow: rgba(29,184,122,0.22);
+  --amber: #f59e0b;
+  --amber-dim: rgba(245,158,11,0.14);
+  --red: #ef4444;
+  --text: #eef2ff;
+  --text2: #7d8caa;
+  --text3: #49556e;
+  --radius: 16px;
+  --radius-sm: 10px;
+  --nav-h: 72px;
+  --safe-b: env(safe-area-inset-bottom, 0px);
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; overflow: hidden; }
+
+/* ── AUTH SCREEN ── */
+#auth-screen {
+  position: fixed; inset: 0; background: var(--bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 32px 28px; z-index: 1000;
+}
+.auth-logo { font-size: 56px; margin-bottom: 8px; }
+.auth-brand { font-family: 'DM Serif Display', serif; font-size: 32px; color: var(--text); margin-bottom: 4px; }
+.auth-tagline { font-size: 14px; color: var(--text2); margin-bottom: 36px; text-align: center; line-height: 1.5; }
+#auth-mode { width: 100%; max-width: 360px; }
+.auth-section-title { font-family: 'DM Serif Display', serif; font-size: 22px; color: var(--text); margin-bottom: 20px; }
+.auth-field { margin-bottom: 12px; }
+.auth-label { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text3); margin-bottom: 5px; display: block; }
+.auth-input { width: 100%; padding: 12px 14px; border: 1px solid var(--border2); border-radius: var(--radius-sm); font-size: 15px; color: var(--text); background: var(--bg3); font-family: 'DM Sans', sans-serif; outline: none; transition: border-color .2s; }
+.auth-input:focus { border-color: var(--green); }
+.auth-btn { width: 100%; padding: 14px; border: none; border-radius: var(--radius-sm); font-size: 15px; font-weight: 600; cursor: pointer; font-family: 'DM Sans', sans-serif; margin-top: 4px; transition: opacity .15s; }
+.auth-btn.primary { background: var(--green); color: #fff; }
+.auth-btn.google { background: var(--bg3); color: var(--text); border: 1px solid var(--border2); margin-top: 10px; }
+.auth-btn:active { opacity: .85; }
+.auth-divider { text-align: center; font-size: 12px; color: var(--text3); margin: 12px 0; }
+#auth-error { font-size: 13px; color: var(--red); margin-top: 8px; min-height: 18px; text-align: center; }
+.auth-toggle { text-align: center; font-size: 13px; color: var(--text2); margin-top: 20px; }
+.auth-toggle button { background: none; border: none; color: var(--green); font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 600; cursor: pointer; }
+
+/* ── APP ── */
+#app { display: none; flex-direction: column; height: 100%; max-width: 430px; margin: 0 auto; position: relative; }
+.screen { flex: 1; overflow-y: auto; display: none; flex-direction: column; padding-bottom: calc(var(--nav-h) + var(--safe-b) + 16px); }
+.screen.active { display: flex; }
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+/* ── NAV ── */
+nav { position: absolute; bottom: 0; left: 0; right: 0; height: calc(var(--nav-h) + var(--safe-b)); background: var(--bg2); border-top: 1px solid var(--border); display: flex; align-items: flex-start; padding-top: 8px; z-index: 100; }
+.nav-btn { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer; padding: 4px 0; border: none; background: transparent; color: var(--text3); transition: color .2s; }
+.nav-btn.active { color: var(--green); }
+.nav-icon { font-size: 20px; line-height: 1; }
+.nav-label { font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+
+/* ── FAB ── */
+#fab { position: absolute; bottom: calc(var(--nav-h) + var(--safe-b) + 16px); right: 20px; width: 52px; height: 52px; border-radius: 50%; background: var(--green); color: #fff; font-size: 26px; display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 101; border: none; box-shadow: 0 4px 20px var(--green-glow); transition: transform .15s; }
+#fab:active { transform: scale(.93); }
+
+/* ── HEADERS ── */
+.page-header { padding: 52px 24px 16px; flex-shrink: 0; }
+.page-title { font-family: 'DM Serif Display', serif; font-size: 30px; color: var(--text); letter-spacing: -.4px; }
+.page-subtitle { font-size: 13px; color: var(--text2); margin-top: 3px; }
+
+/* ── TODAY HERO ── */
+.today-hero { margin: 0 16px 16px; background: linear-gradient(135deg, var(--bg3), var(--surface)); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; position: relative; overflow: hidden; }
+.today-hero::before { content: ''; position: absolute; top: -50px; right: -50px; width: 180px; height: 180px; background: radial-gradient(circle, var(--green-glow), transparent 70%); pointer-events: none; }
+.hero-row { display: flex; align-items: center; gap: 14px; }
+.ring-wrap { position: relative; flex-shrink: 0; }
+.ring-wrap svg { display: block; }
+.ring-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+.ring-num { font-family: 'DM Serif Display', serif; font-size: 20px; color: var(--text); line-height: 1; }
+.ring-denom { font-size: 11px; color: var(--text2); }
+.hero-info { flex: 1; }
+.hero-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.hero-sub { font-size: 13px; color: var(--text2); margin-top: 2px; }
+.streak-pill { display: inline-flex; align-items: center; gap: 5px; background: var(--amber-dim); border: 1px solid rgba(245,158,11,.22); color: var(--amber); font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 20px; margin-top: 8px; }
+
+/* ── HABIT CARDS ── */
+.section-head { padding: 4px 24px 8px; font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--text3); }
+.habits-group { padding: 0 16px; display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
+.habit-card { display: flex; align-items: center; gap: 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 13px; cursor: pointer; transition: border-color .2s, background .15s; animation: fadeIn .25s ease both; }
+.habit-card:active { background: var(--bg3); }
+.habit-card.done { border-color: rgba(29,184,122,.25); }
+.hc-icon { width: 40px; height: 40px; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-size: 19px; flex-shrink: 0; }
+.hc-info { flex: 1; min-width: 0; }
+.hc-name { font-size: 15px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hc-name.struck { text-decoration: line-through; color: var(--text3); }
+.hc-meta { font-size: 12px; color: var(--text2); margin-top: 2px; }
+.check { width: 30px; height: 30px; border-radius: 50%; border: 2px solid var(--border2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: all .2s; background: transparent; }
+.check.done { background: var(--green); border-color: var(--green); }
+.check svg { opacity: 0; transition: opacity .2s; }
+.check.done svg { opacity: 1; }
+@keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+@keyframes pop { 0%{transform:scale(1)} 40%{transform:scale(1.35)} 70%{transform:scale(.92)} 100%{transform:scale(1)} }
+.popping { animation: pop .38s cubic-bezier(.36,.07,.19,.97); }
+
+/* ── EMPTY ── */
+.empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 40px; text-align: center; flex: 1; }
+.empty-icon { font-size: 52px; margin-bottom: 16px; opacity: .6; }
+.empty-title { font-family: 'DM Serif Display', serif; font-size: 24px; color: var(--text); margin-bottom: 8px; }
+.empty-sub { font-size: 14px; color: var(--text2); line-height: 1.6; }
+
+/* ── CALENDAR ── */
+.cal-nav { display: flex; align-items: center; justify-content: space-between; padding: 0 24px; margin-bottom: 16px; }
+.cal-month { font-family: 'DM Serif Display', serif; font-size: 22px; color: var(--text); }
+.cal-arrow { width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--border2); background: var(--bg2); color: var(--text2); font-size: 16px; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.cal-day-names { display: grid; grid-template-columns: repeat(7,1fr); padding: 0 16px; margin-bottom: 4px; }
+.cal-dn { text-align: center; font-size: 11px; font-weight: 600; color: var(--text3); letter-spacing: .04em; padding: 4px 0; }
+.cal-grid { display: grid; grid-template-columns: repeat(7,1fr); gap: 3px; padding: 0 16px 14px; }
+.cal-cell { aspect-ratio: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; border-radius: 7px; cursor: pointer; position: relative; }
+.cal-cell:hover { background: var(--bg3); }
+.cal-num { font-size: 13px; color: var(--text); font-weight: 400; z-index: 1; position: relative; }
+.cal-cell.today-cell .cal-today-bg { position: absolute; inset: 0; background: var(--green); border-radius: 7px; }
+.cal-cell.today-cell .cal-num { color: #fff; font-weight: 600; }
+.cal-dot { width: 5px; height: 5px; border-radius: 50%; margin-top: 2px; z-index: 1; position: relative; }
+.dot-full { background: var(--green); }
+.dot-partial { background: rgba(29,184,122,.4); }
+.dot-miss { background: var(--bg4); }
+.cal-detail { margin: 0 16px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.cal-detail-date { font-size: 12px; font-weight: 700; color: var(--text2); margin-bottom: 10px; letter-spacing: .06em; text-transform: uppercase; }
+.cal-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--border); }
+.cal-row:last-child { border-bottom: none; }
+.cal-row-icon { font-size: 15px; }
+.cal-row-name { flex: 1; font-size: 14px; color: var(--text); }
+.cal-row-status { font-size: 15px; }
+
+/* ── STATS ── */
+.period-tabs { display: flex; gap: 8px; padding: 0 16px 16px; }
+.period-btn { flex: 1; padding: 8px 0; border-radius: 20px; font-size: 13px; font-weight: 600; border: 1px solid var(--border2); background: transparent; cursor: pointer; color: var(--text2); font-family: 'DM Sans', sans-serif; transition: all .15s; }
+.period-btn.active { background: var(--green-dim); color: var(--green); border-color: rgba(29,184,122,.35); }
+.kpi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 16px 14px; }
+.kpi-card { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; }
+.kpi-label { font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text3); }
+.kpi-value { font-family: 'DM Serif Display', serif; font-size: 28px; color: var(--text); line-height: 1.15; margin-top: 4px; word-break: break-word; }
+.kpi-unit { font-size: 11px; color: var(--text2); margin-top: 2px; }
+.heatmap-wrap { margin: 0 16px 14px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.heatmap-title { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text3); margin-bottom: 10px; }
+#heatmap { display: flex; flex-wrap: wrap; gap: 4px; }
+.hm-cell { width: calc((100% - 4px*29)/30); min-width: 8px; aspect-ratio: 1; border-radius: 2px; transition: background .3s; }
+.chart-wrap { margin: 0 16px 14px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.chart-title { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text3); margin-bottom: 12px; }
+.bar-chart { display: flex; align-items: flex-end; gap: 6px; height: 72px; }
+.bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px; height: 100%; justify-content: flex-end; }
+.bar { width: 100%; border-radius: 3px 3px 0 0; background: var(--bg4); }
+.bar.today-bar { background: var(--green); }
+.bar.has-data { background: var(--bg3); }
+.bar-day { font-size: 9px; color: var(--text3); font-weight: 600; }
+.habit-stat { display: flex; align-items: center; gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--border); }
+.habit-stat:last-child { border-bottom: none; }
+.hs-icon { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 15px; flex-shrink: 0; }
+.hs-info { flex: 1; min-width: 0; }
+.hs-name { font-size: 13px; font-weight: 500; color: var(--text); }
+.hs-bar-bg { height: 4px; background: var(--bg4); border-radius: 2px; margin-top: 5px; }
+.hs-bar-fill { height: 4px; border-radius: 2px; background: var(--green); transition: width .5s; }
+.hs-pct { font-size: 12px; color: var(--text2); font-weight: 600; flex-shrink: 0; }
+
+/* ── ACCOUNT TAB ── */
+.acc-profile { margin: 0 16px 14px; background: linear-gradient(135deg, var(--bg2), var(--surface)); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; display: flex; align-items: center; gap: 14px; }
+.acc-avatar { width: 52px; height: 52px; border-radius: 50%; background: var(--green); display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: #fff; flex-shrink: 0; }
+.acc-name { font-size: 16px; font-weight: 600; color: var(--text); }
+.acc-email { font-size: 12px; color: var(--text2); margin-top: 2px; }
+.acc-plan-badge { font-size: 11px; color: var(--green); background: var(--green-dim); padding: 2px 8px; border-radius: 20px; display: inline-block; margin-top: 5px; }
+.settings-group { margin: 0 16px 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.settings-row { display: flex; align-items: center; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--border); }
+.settings-row:last-child { border-bottom: none; }
+.sr-icon { font-size: 17px; width: 22px; text-align: center; }
+.sr-label { flex: 1; font-size: 14px; color: var(--text); }
+.sr-value { font-size: 13px; color: var(--text2); }
+.toggle { width: 38px; height: 21px; border-radius: 11px; position: relative; cursor: pointer; transition: background .2s; flex-shrink: 0; }
+.toggle.on { background: var(--green); }
+.toggle.off { background: var(--bg4); }
+.toggle-dot { width: 17px; height: 17px; border-radius: 50%; background: #fff; position: absolute; top: 2px; transition: left .2s; }
+.toggle.on .toggle-dot { left: 19px; }
+.toggle.off .toggle-dot { left: 2px; }
+.limit-control { display: flex; align-items: center; gap: 0; }
+.limit-btn { width: 28px; height: 28px; border-radius: 50%; border: 1px solid var(--border2); background: var(--bg3); color: var(--text); font-size: 16px; display: flex; align-items: center; justify-content: center; cursor: pointer; line-height: 1; }
+.limit-btn:active { background: var(--bg4); }
+#limit-val { font-size: 15px; font-weight: 600; color: var(--green); min-width: 32px; text-align: center; }
+.export-btn { flex: 1; padding: 10px 6px; border: 1px solid var(--border2); background: var(--bg3); color: var(--text); border-radius: var(--radius-sm); font-size: 12px; font-weight: 500; cursor: pointer; font-family: 'DM Sans', sans-serif; text-align: center; transition: background .15s; }
+.export-btn:hover { background: var(--bg4); }
+.device-row { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.device-row:last-child { border-bottom: none; }
+.device-icon { font-size: 20px; width: 24px; text-align: center; }
+.device-info { flex: 1; }
+.device-name { font-size: 14px; color: var(--text); font-weight: 500; }
+.device-meta { font-size: 12px; color: var(--text2); margin-top: 2px; }
+.this-device { font-size: 10px; background: var(--green-dim); color: var(--green); padding: 2px 6px; border-radius: 10px; font-weight: 600; margin-left: 6px; }
+.device-remove { font-size: 12px; color: var(--red); background: none; border: 1px solid rgba(239,68,68,.25); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-family: 'DM Sans', sans-serif; }
+.section-lbl { padding: 14px 16px 6px; font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text3); }
+.danger-btn { width: calc(100% - 32px); margin: 0 16px 4px; padding: 12px; background: transparent; border: 1px solid rgba(239,68,68,.25); color: var(--red); border-radius: var(--radius-sm); font-size: 14px; font-weight: 600; cursor: pointer; font-family: 'DM Sans', sans-serif; }
+
+/* ── MODALS ── */
+.overlay { display: none; position: absolute; inset: 0; background: rgba(0,0,0,.65); z-index: 200; align-items: flex-end; backdrop-filter: blur(6px); }
+.overlay.open { display: flex; }
+.sheet { background: var(--bg2); border-radius: 24px 24px 0 0; width: 100%; border-top: 1px solid var(--border2); animation: slideUp .28s cubic-bezier(.32,.72,0,1); max-height: 90vh; overflow-y: auto; }
+@keyframes slideUp { from{transform:translateY(100%)} to{transform:translateY(0)} }
+.sheet-handle { width: 40px; height: 4px; background: var(--bg4); border-radius: 2px; margin: 12px auto 14px; }
+.sheet-body { padding: 0 20px calc(var(--safe-b) + 24px); }
+.sheet-title { font-family: 'DM Serif Display', serif; font-size: 24px; color: var(--text); margin-bottom: 18px; }
+.field-lbl { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--text3); margin-bottom: 5px; }
+.field-input { width: 100%; padding: 12px 14px; border: 1px solid var(--border2); border-radius: var(--radius-sm); font-size: 15px; color: var(--text); background: var(--bg3); font-family: 'DM Sans', sans-serif; margin-bottom: 14px; outline: none; transition: border-color .2s; }
+.field-input:focus { border-color: var(--green); }
+.icon-picker { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 14px; }
+.ip-opt { width: 42px; height: 42px; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-size: 19px; cursor: pointer; border: 2px solid transparent; background: var(--bg3); transition: border-color .15s; }
+.ip-opt.sel { border-color: var(--green); }
+.time-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+.time-chip { padding: 6px 14px; border-radius: 20px; font-size: 13px; font-weight: 500; border: 1px solid var(--border2); cursor: pointer; color: var(--text2); background: transparent; font-family: 'DM Sans', sans-serif; transition: all .15s; }
+.time-chip.sel { background: var(--green-dim); color: var(--green); border-color: rgba(29,184,122,.35); }
+.sheet-btn { width: 100%; padding: 14px; background: var(--green); color: #fff; border: none; border-radius: var(--radius-sm); font-size: 15px; font-weight: 600; cursor: pointer; font-family: 'DM Sans', sans-serif; letter-spacing: .02em; }
+.sheet-btn:active { opacity: .85; }
+
+/* ── DETAIL ── */
+.detail-hero { display: flex; align-items: center; gap: 12px; margin-bottom: 18px; }
+.detail-big-icon { width: 52px; height: 52px; border-radius: 13px; display: flex; align-items: center; justify-content: center; font-size: 24px; flex-shrink: 0; }
+.detail-name { font-family: 'DM Serif Display', serif; font-size: 22px; color: var(--text); }
+.detail-type { font-size: 13px; color: var(--text2); }
+.detail-stats { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; margin-bottom: 18px; }
+.ds { background: var(--bg3); border-radius: var(--radius-sm); padding: 12px; text-align: center; }
+.ds-val { font-family: 'DM Serif Display', serif; font-size: 24px; color: var(--text); }
+.ds-lbl { font-size: 10px; color: var(--text3); margin-top: 2px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.mini-cal { display: grid; grid-template-columns: repeat(7,1fr); gap: 4px; margin-bottom: 18px; }
+.mc { aspect-ratio: 1; border-radius: 4px; }
+.mc-done { background: var(--green); }
+.mc-miss { background: var(--bg4); }
+.detail-actions { display: flex; gap: 8px; }
+.da-btn { flex: 1; padding: 12px; border-radius: var(--radius-sm); font-size: 14px; font-weight: 600; border: 1px solid var(--border2); background: transparent; cursor: pointer; color: var(--text); font-family: 'DM Sans', sans-serif; }
+.da-btn.primary { background: var(--green); border-color: var(--green); color: #fff; }
+.da-btn.danger { color: var(--red); border-color: rgba(239,68,68,.28); }
+
+/* ── TOAST ── */
+#toast { position: fixed; bottom: calc(var(--nav-h) + var(--safe-b) + 80px); left: 50%; transform: translateX(-50%) translateY(20px); background: var(--bg3); border: 1px solid var(--border2); color: var(--text); font-size: 13px; font-weight: 500; padding: 10px 18px; border-radius: 20px; opacity: 0; transition: opacity .25s, transform .25s; z-index: 999; white-space: nowrap; pointer-events: none; }
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ── SYNC INDICATOR ── */
+.sync-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); display: inline-block; margin-left: 4px; animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+/* ── FIREBASE NOTICE ── */
+.firebase-notice { background: var(--amber-dim); border: 1px solid rgba(245,158,11,.3); border-radius: var(--radius-sm); padding: 12px 14px; margin: 0 16px 14px; font-size: 12px; color: var(--amber); line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<!-- AUTH SCREEN -->
+<div id="auth-screen" style="display:flex;">
+  <div class="auth-logo">🔥</div>
+  <div class="auth-brand">Streaks</div>
+  <div class="auth-tagline">Build habits that stick.<br/>Sync across all your devices.</div>
+
+  <div id="auth-mode" data-mode="login" style="width:100%;max-width:360px;">
+    <div class="auth-section-title" id="auth-title">Welcome back</div>
+    <div class="auth-field" id="auth-name-row" style="display:none;">
+      <label class="auth-label">Your name</label>
+      <input class="auth-input" id="auth-name" placeholder="Alex Kim" autocomplete="name"/>
+    </div>
+    <div class="auth-field">
+      <label class="auth-label">Email</label>
+      <input class="auth-input" id="auth-email" type="email" placeholder="you@example.com" autocomplete="email"/>
+    </div>
+    <div class="auth-field">
+      <label class="auth-label">Password</label>
+      <input class="auth-input" id="auth-pass" type="password" placeholder="••••••••" autocomplete="current-password"/>
+    </div>
+    <div id="auth-error"></div>
+    <button class="auth-btn primary" id="auth-submit-btn" onclick="authSubmit()">Sign in</button>
+    <div class="auth-divider">or</div>
+    <button class="auth-btn google" onclick="authGoogle()">🇬 Continue with Google</button>
+    <div class="auth-toggle">
+      <span id="auth-toggle-lbl">Don't have an account? </span>
+      <button id="auth-toggle-btn" onclick="toggleAuthMode()">Sign up</button>
+    </div>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="app">
+
+  <!-- TODAY -->
+  <div class="screen active" id="screen-today">
+    <div class="page-header" style="padding-bottom:10px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+        <div>
+          <div class="page-title" id="greeting-text">Good morning</div>
+          <div class="page-subtitle" id="date-text">Loading…</div>
+        </div>
+        <div id="user-avatar" style="width:40px;height:40px;border-radius:50%;background:var(--green);display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:700;color:#fff;cursor:pointer;flex-shrink:0;" onclick="showScreen('account')">?</div>
+      </div>
+    </div>
+    <div class="today-hero">
+      <div class="hero-row">
+        <div class="ring-wrap">
+          <svg width="66" height="66" viewBox="0 0 66 66">
+            <circle cx="33" cy="33" r="27" fill="none" stroke="rgba(255,255,255,.07)" stroke-width="6"/>
+            <circle id="ring-arc" cx="33" cy="33" r="27" fill="none" stroke="var(--green)" stroke-width="6" stroke-linecap="round" stroke-dasharray="169.6" stroke-dashoffset="169.6" transform="rotate(-90 33 33)" style="transition:stroke-dashoffset .5s ease;"/>
+          </svg>
+          <div class="ring-center">
+            <span class="ring-num" id="ring-done">0</span>
+            <span class="ring-denom" id="ring-total">/ 0</span>
+          </div>
+        </div>
+        <div class="hero-info">
+          <div class="hero-title" id="hero-title">Loading…</div>
+          <div class="hero-sub" id="hero-sub">Syncing your habits</div>
+          <div class="streak-pill">🔥 <span id="streak-num">0</span> day streak</div>
+        </div>
+      </div>
+    </div>
+    <div id="today-content" style="flex:1;"></div>
+  </div>
+
+  <!-- CALENDAR -->
+  <div class="screen" id="screen-cal">
+    <div class="page-header" style="padding-bottom:4px;">
+      <div class="page-title">Calendar</div>
+    </div>
+    <div style="padding:12px 0 0;">
+      <div class="cal-nav">
+        <button class="cal-arrow" onclick="prevMonth()">‹</button>
+        <div class="cal-month" id="cal-month-lbl"></div>
+        <button class="cal-arrow" onclick="nextMonth()">›</button>
+      </div>
+      <div class="cal-day-names">
+        <div class="cal-dn">Su</div><div class="cal-dn">Mo</div><div class="cal-dn">Tu</div>
+        <div class="cal-dn">We</div><div class="cal-dn">Th</div><div class="cal-dn">Fr</div><div class="cal-dn">Sa</div>
+      </div>
+      <div class="cal-grid" id="cal-grid"></div>
+      <div class="cal-detail" id="cal-detail"><div class="cal-detail-date" style="color:var(--text3);">Select a date</div></div>
+    </div>
+  </div>
+
+  <!-- STATS -->
+  <div class="screen" id="screen-stats">
+    <div class="page-header" style="padding-bottom:4px;">
+      <div class="page-title">Statistics</div>
+    </div>
+    <div class="period-tabs">
+      <button class="period-btn active" data-p="week" onclick="setStatsPeriod('week')">This Week</button>
+      <button class="period-btn" data-p="month" onclick="setStatsPeriod('month')">This Month</button>
+      <button class="period-btn" data-p="all" onclick="setStatsPeriod('all')">All Time</button>
+    </div>
+    <!-- KPI Cards -->
+    <div class="kpi-grid">
+      <div class="kpi-card"><div class="kpi-label">Total completions</div><div class="kpi-value" id="kpi-completions">—</div><div class="kpi-unit">in period</div></div>
+      <div class="kpi-card"><div class="kpi-label">Avg daily rate</div><div class="kpi-value" id="kpi-avg-rate">—</div><div class="kpi-unit">completion</div></div>
+      <div class="kpi-card"><div class="kpi-label">Best streak</div><div class="kpi-value" id="kpi-best-streak">—</div><div class="kpi-unit">days</div></div>
+      <div class="kpi-card"><div class="kpi-label">Most consistent</div><div class="kpi-value" style="font-size:16px;" id="kpi-consistent">—</div><div class="kpi-unit">habit</div></div>
+    </div>
+    <!-- Heatmap -->
+    <div class="heatmap-wrap">
+      <div class="heatmap-title">Activity heatmap</div>
+      <div id="heatmap"></div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:10px;">
+        <span style="font-size:10px;color:var(--text3);">Less</span>
+        <div style="width:12px;height:12px;border-radius:2px;background:var(--bg4);"></div>
+        <div style="width:12px;height:12px;border-radius:2px;background:rgba(29,184,122,0.25);"></div>
+        <div style="width:12px;height:12px;border-radius:2px;background:rgba(29,184,122,0.55);"></div>
+        <div style="width:12px;height:12px;border-radius:2px;background:rgba(29,184,122,0.8);"></div>
+        <div style="width:12px;height:12px;border-radius:2px;background:var(--green);"></div>
+        <span style="font-size:10px;color:var(--text3);">More</span>
+      </div>
+    </div>
+    <!-- Bar chart -->
+    <div class="chart-wrap">
+      <div class="chart-title">Daily completions</div>
+      <div class="bar-chart" id="week-chart"></div>
+    </div>
+    <!-- Per habit -->
+    <div style="padding:0 16px 6px;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);">Per habit</div>
+    <div style="padding:0 16px 20px;" id="habit-stats"></div>
+  </div>
+
+  <!-- ACCOUNT / SETTINGS -->
+  <div class="screen" id="screen-account">
+    <div class="page-header" style="padding-bottom:12px;">
+      <div class="page-title">Account</div>
+      <div class="page-subtitle">
+        <span class="sync-dot"></span> Syncing in real-time
+      </div>
+    </div>
+    <div class="acc-profile">
+      <div class="acc-avatar" id="acc-avatar">?</div>
+      <div>
+        <div class="acc-name" id="acc-name">Loading…</div>
+        <div class="acc-email" id="acc-email"></div>
+        <div class="acc-plan-badge" id="acc-plan">0/10 habits</div>
+      </div>
+    </div>
+
+    <!-- Habit Limit -->
+    <div class="section-lbl">Habit limit</div>
+    <div class="settings-group">
+      <div class="settings-row">
+        <div class="sr-icon">📋</div>
+        <div class="sr-label">Max active habits</div>
+        <div class="limit-control">
+          <button class="limit-btn" onclick="adjustLimit(-1)">−</button>
+          <span id="limit-val">10</span>
+          <button class="limit-btn" onclick="adjustLimit(1)">+</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Export PDF -->
+    <div class="section-lbl">Export data as PDF</div>
+    <div style="padding:0 16px 14px;display:flex;gap:8px;">
+      <button class="export-btn" onclick="exportPDF('today')">📄 Today</button>
+      <button class="export-btn" onclick="exportPDF('month')">📅 This Month</button>
+      <button class="export-btn" onclick="exportPDF('history')">🗂 Full History</button>
+    </div>
+
+    <!-- Devices -->
+    <div class="section-lbl">Active devices</div>
+    <div class="settings-group" id="devices-list">
+      <div style="padding:14px 16px;font-size:13px;color:var(--text3);">Loading devices…</div>
+    </div>
+
+    <!-- Preferences -->
+    <div class="section-lbl">Preferences</div>
+    <div class="settings-group">
+      <div class="settings-row">
+        <div class="sr-icon">🔔</div>
+        <div class="sr-label">Reminders</div>
+        <div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off');"><div class="toggle-dot"></div></div>
+      </div>
+      <div class="settings-row">
+        <div class="sr-icon">🎉</div>
+        <div class="sr-label">Streak celebrations</div>
+        <div class="toggle on" onclick="this.classList.toggle('on');this.classList.toggle('off');"><div class="toggle-dot"></div></div>
+      </div>
+    </div>
+
+    <!-- Danger zone -->
+    <div class="section-lbl">Danger zone</div>
+    <button class="danger-btn" onclick="doSignOut()">Sign out of this device</button>
+    <div style="height:20px;"></div>
+    <div style="padding:0 24px 20px;font-size:12px;color:var(--text3);text-align:center;line-height:1.6;">
+      All data is encrypted and stored securely in Firebase.<br/>Your habits sync instantly across all signed-in devices.
+    </div>
+  </div>
+
+  <!-- BOTTOM NAV -->
+  <nav>
+    <button class="nav-btn active" onclick="showScreen('today')" id="nav-today">
+      <span class="nav-icon">⊡</span><span class="nav-label">Today</span>
+    </button>
+    <button class="nav-btn" onclick="showScreen('cal')" id="nav-cal">
+      <span class="nav-icon">⊟</span><span class="nav-label">Calendar</span>
+    </button>
+    <button class="nav-btn" onclick="showScreen('stats')" id="nav-stats">
+      <span class="nav-icon">◈</span><span class="nav-label">Stats</span>
+    </button>
+    <button class="nav-btn" onclick="showScreen('account')" id="nav-account">
+      <span class="nav-icon">⊙</span><span class="nav-label">Account</span>
+    </button>
+  </nav>
+
+  <button id="fab" onclick="openAddModal()">+</button>
+</div>
+
+<!-- ADD HABIT MODAL -->
+<div class="overlay" id="add-overlay" onclick="closeAdd(event)">
+  <div class="sheet">
+    <div class="sheet-handle"></div>
+    <div class="sheet-body">
+      <div class="sheet-title">New habit</div>
+      <div class="field-lbl">Name</div>
+      <input class="field-input" id="new-name" placeholder="e.g. Morning run" maxlength="40"/>
+      <div class="field-lbl">Icon</div>
+      <div class="icon-picker" id="icon-picker"></div>
+      <div class="field-lbl">Time of day</div>
+      <div class="time-chips" id="time-chips"></div>
+      <button class="sheet-btn" onclick="addHabit()">Add habit ✓</button>
+    </div>
+  </div>
+</div>
+
+<!-- DETAIL MODAL -->
+<div class="overlay" id="detail-overlay" onclick="closeDetail(event)">
+  <div class="sheet">
+    <div class="sheet-handle"></div>
+    <div class="sheet-body" id="detail-body"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
+</script>
+</body>
+</html>
